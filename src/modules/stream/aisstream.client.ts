@@ -44,15 +44,31 @@ export class AisStreamClient {
       `select mmsi from active_watchlist where status = 'active'`
     );
 
-    const list = rs.rows.map((r: { mmsi: string | number }) => String(r.mmsi));
+    const rawList = rs.rows.map((r: { mmsi: string | number }) =>
+      String(r.mmsi).trim()
+    );
+    const list = rawList.filter((mmsi) => /^\d{9}$/.test(mmsi));
+    const invalidList = rawList.filter((mmsi) => !/^\d{9}$/.test(mmsi));
+
+    if (invalidList.length > 0) {
+      console.log('[AIS] invalid MMSI skipped =', invalidList);
+    }
+
     this.trackedMmsi = new Set(list);
 
     console.log('[AIS] active tracked MMSI =', list);
 
-    await this.safeLog('info', 'reload_tracked_mmsi', null, 'reloaded tracked MMSI list', {
-      trackedMmsi: list,
-      count: list.length,
-    });
+    await this.safeLog(
+      'info',
+      'reload_tracked_mmsi',
+      null,
+      'reloaded tracked MMSI list',
+      {
+        trackedMmsi: list,
+        invalidMmsi: invalidList,
+        count: list.length,
+      }
+    );
 
     if (this.trackedMmsi.size === 0) {
       console.log('[AIS] no active MMSI in watchlist');
@@ -108,19 +124,24 @@ export class AisStreamClient {
 
     this.ws.on('message', async (data) => {
       const text = data.toString();
+      console.log('[AIS] raw message received =', text.slice(0, 1000));
 
       try {
-        console.log('[AIS] raw message received =', text.slice(0, 500));
-
         const json = JSON.parse(text);
         const parsed = this.parseMessage(json);
 
         if (!parsed) {
           console.log('[AIS] message received but not a supported position report');
 
-          await this.safeLog('info', 'message_ignored', null, 'unsupported or non-position message', {
-            preview: text.slice(0, 500),
-          });
+          await this.safeLog(
+            'info',
+            'message_ignored',
+            null,
+            'unsupported or non-position message',
+            {
+              preview: text.slice(0, 1000),
+            }
+          );
           return;
         }
 
@@ -159,11 +180,18 @@ export class AisStreamClient {
           },
         });
       } catch (error: any) {
-        console.error('[AIS] parse/write error:', error);
+        console.error('[AIS] message parse/write error =', error);
+        console.error('[AIS] raw text on parse error =', text.slice(0, 1000));
 
-        await this.safeLog('error', 'message_process_error', null, error?.message || 'parse/write error', {
-          raw: text.slice(0, 1000),
-        });
+        await this.safeLog(
+          'error',
+          'message_process_error',
+          null,
+          error?.message || 'parse/write error',
+          {
+            raw: text.slice(0, 1000),
+          }
+        );
       }
     });
 
@@ -171,11 +199,19 @@ export class AisStreamClient {
       this.isConnecting = false;
       const reasonText = reason?.toString?.() || '';
 
-      console.log('[AIS] ws closed, code =', code, 'reason =', reasonText);
+      console.log(
+        '[AIS] ws closed, code =',
+        code,
+        'reason =',
+        reasonText,
+        'readyState =',
+        this.ws?.readyState
+      );
 
       await this.safeLog('error', 'ws_close', null, 'websocket closed', {
         code,
         reason: reasonText,
+        readyState: this.ws?.readyState ?? null,
       });
 
       this.scheduleReconnect();
@@ -183,10 +219,12 @@ export class AisStreamClient {
 
     this.ws.on('error', async (error: any) => {
       this.isConnecting = false;
-      console.error('[AIS] ws error:', error);
+      console.error('[AIS] ws error full =', error);
+      console.error('[AIS] ws error message =', error?.message);
 
       await this.safeLog('error', 'ws_error', null, error?.message || 'websocket error', {
         stack: error?.stack || null,
+        raw: String(error),
       });
 
       this.scheduleReconnect();
@@ -212,21 +250,26 @@ export class AisStreamClient {
     }, 5000);
   }
 
-  private sendSubscribe() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.log('[AIS] subscribe skipped: ws not open');
-      return;
-    }
+private sendSubscribe() {
+  try {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    if (this.trackedMmsi.size === 0) {
-      console.log('[AIS] no tracked MMSI, skip subscribe');
-      return;
-    }
+    const mmsiListRaw = Array.isArray(this.trackedMmsi)
+      ? this.trackedMmsi
+      : this.trackedMmsi instanceof Set
+        ? Array.from(this.trackedMmsi)
+        : this.trackedMmsi
+          ? [this.trackedMmsi]
+          : [];
+
+    const mmsiList = mmsiListRaw
+      .map((x) => String(x).trim())
+      .filter(Boolean);
 
     const payload = {
       APIKey: env.AISSTREAM_API_KEY,
       BoundingBoxes: [[[-90, -180], [90, 180]]],
-      FiltersShipMMSI: [...this.trackedMmsi],
+      FiltersShipMMSI: mmsiList,
       FilterMessageTypes: [
         'PositionReport',
         'StandardClassBPositionReport',
@@ -234,23 +277,17 @@ export class AisStreamClient {
       ],
     };
 
-    console.log('[AIS] api key exists =', Boolean(env.AISSTREAM_API_KEY));
-    console.log('[AIS] subscribing MMSI list =', payload.FiltersShipMMSI);
     console.log('[AIS] subscription payload preview =', {
-      BoundingBoxes: payload.BoundingBoxes,
-      FiltersShipMMSI: payload.FiltersShipMMSI,
-      FilterMessageTypes: payload.FilterMessageTypes,
+      ...payload,
+      APIKey: '***masked***',
     });
 
     this.ws.send(JSON.stringify(payload));
-    console.log('[AIS] subscription sent, count =', this.trackedMmsi.size);
-
-    void this.safeLog('info', 'subscribe_sent', null, 'subscription sent to AIS upstream', {
-      trackedMmsi: payload.FiltersShipMMSI,
-      count: payload.FiltersShipMMSI.length,
-      hasApiKey: Boolean(env.AISSTREAM_API_KEY),
-    });
+    console.log('[AIS] subscription sent');
+  } catch (err) {
+    console.error('[AIS] sendSubscribe error =', err);
   }
+}
 
   private parseMessage(msg: any): ParsedPosition | null {
     const report =
